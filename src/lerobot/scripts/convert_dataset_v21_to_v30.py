@@ -565,7 +565,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--push-to-hub",
         type=lambda input: input.lower() == "true",
-        default=True,
+        default=False,
         help="Push the converted dataset to the hub.",
     )
     parser.add_argument(

@@ -227,6 +227,7 @@ lerobot-find-joint-limits="lerobot.scripts.lerobot_find_joint_limits:main"
 lerobot-imgtransform-viz="lerobot.scripts.lerobot_imgtransform_viz:main"
 lerobot-edit-dataset="lerobot.scripts.lerobot_edit_dataset:main"
 lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
+lerobot-export-merged="lerobot.scripts.lerobot_export_merged:main"
 
 # ---------------- Tool Configurations ----------------
 [tool.setuptools.package-data]

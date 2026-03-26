@@ -82,50 +82,38 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
     )
 
-    if isinstance(cfg.dataset.repo_id, str):
-        ds_meta = LeRobotDatasetMetadata(
-            cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
-        )
-        delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
-        if not cfg.dataset.streaming:
-            dataset = LeRobotDataset(
-                cfg.dataset.repo_id,
-                root=cfg.dataset.root,
-                episodes=cfg.dataset.episodes,
-                delta_timestamps=delta_timestamps,
-                image_transforms=image_transforms,
-                revision=cfg.dataset.revision,
-                video_backend=cfg.dataset.video_backend,
-                tolerance_s=cfg.tolerance_s,
-            )
-        else:
-            dataset = StreamingLeRobotDataset(
-                cfg.dataset.repo_id,
-                root=cfg.dataset.root,
-                episodes=cfg.dataset.episodes,
-                delta_timestamps=delta_timestamps,
-                image_transforms=image_transforms,
-                revision=cfg.dataset.revision,
-                max_num_shards=cfg.num_workers,
-                tolerance_s=cfg.tolerance_s,
-            )
-    else:
-        raise NotImplementedError("The MultiLeRobotDataset isn't supported for now.")
-        dataset = MultiLeRobotDataset(
+    ds_meta = LeRobotDatasetMetadata(
+        cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
+    )
+    delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+    if not cfg.dataset.streaming:
+        dataset = LeRobotDataset(
             cfg.dataset.repo_id,
-            # TODO(aliberts): add proper support for multi dataset
-            # delta_timestamps=delta_timestamps,
+            root=cfg.dataset.root,
+            episodes=cfg.dataset.episodes,
+            delta_timestamps=delta_timestamps,
             image_transforms=image_transforms,
+            revision=cfg.dataset.revision,
             video_backend=cfg.dataset.video_backend,
+            tolerance_s=cfg.tolerance_s,
         )
-        logging.info(
-            "Multiple datasets were provided. Applied the following index mapping to the provided datasets: "
-            f"{pformat(dataset.repo_id_to_index, indent=2)}"
+    else:
+        dataset = StreamingLeRobotDataset(
+            cfg.dataset.repo_id,
+            root=cfg.dataset.root,
+            episodes=cfg.dataset.episodes,
+            delta_timestamps=delta_timestamps,
+            image_transforms=image_transforms,
+            revision=cfg.dataset.revision,
+            max_num_shards=cfg.num_workers,
+            tolerance_s=cfg.tolerance_s,
         )
 
     if cfg.dataset.use_imagenet_stats:
         for key in dataset.meta.camera_keys:
             for stats_type, stats in IMAGENET_STATS.items():
+                if key not in dataset.meta.stats:
+                    dataset.meta.stats[key] = {}
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
     return dataset

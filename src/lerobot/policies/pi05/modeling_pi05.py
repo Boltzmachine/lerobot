@@ -335,13 +335,13 @@ def get_gemma_config(variant: str) -> GemmaConfig:  # see openpi `gemma.py: get_
         raise ValueError(f"Unknown variant: {variant}")
 
 
-def sample_gumbel(shape, eps=1e-5):
-    U = torch.rand(shape)
+def sample_gumbel(shape, device=None, dtype=None, eps=1e-5):
+    U = torch.rand(shape, device=device, dtype=dtype)
     return -torch.log(-torch.log(U + eps) + eps)
 
 
 def gumbel_softmax_sample(logits, temperature):
-    y = logits + sample_gumbel(logits.size()).to(logits.device)
+    y = logits + sample_gumbel(logits.size(), device=logits.device, dtype=logits.dtype)
     return F.softmax(y / temperature, dim=-1)
 
 def gumbel_softmax(logits, temperature=1., hard=True, use_uniform=False):
@@ -793,12 +793,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             start = end
 
         if self.cache_gate is not None:
-            gates, gate_logits_list = self.cache_gate(
-                x_past=history_img_embs,
-                x_curr=current_img_emb,
-                t_past=None,
-                t_curr=None,
-            )
+            # Use positional args for compatibility with PEFT's AuxiliaryTrainingWrapper,
+            # which expects the first argument as positional (`x`) for modules_to_save.
+            gates, gate_logits_list = self.cache_gate(history_img_embs, current_img_emb, None, None)
             prev_g = None
             for g in gates:
                 if prev_g is not None:

@@ -16,6 +16,7 @@
 import concurrent.futures
 import contextlib
 import logging
+import random
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -107,6 +108,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
         encoder_threads: int | None = None,
+        static_observation_delta_ranges: list[int] | None = None,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -244,6 +246,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.episodes_since_last_encoding = 0
         self.vcodec = resolve_vcodec(vcodec)
         self._encoder_threads = encoder_threads
+        self.static_observation_delta_ranges = static_observation_delta_ranges
 
         # Unused attributes
         self.image_writer = None
@@ -524,6 +527,50 @@ class LeRobotDataset(torch.utils.data.Dataset):
         }
         return query_indices, padding
 
+    def _sample_static_history_deltas(self) -> list[int]:
+        """Sample hierarchical negative deltas from configured history ranges."""
+        if not self.static_observation_delta_ranges:
+            return []
+        bounds = sorted([abs(int(v)) for v in self.static_observation_delta_ranges], reverse=True)
+        sampled_neg = []
+        minval = 1
+        for bound in reversed(bounds):
+            if bound < minval:
+                sampled = minval
+            else:
+                sampled = random.randint(minval, bound)
+            sampled_neg.insert(0, -sampled)
+            minval = sampled + 1
+        return sampled_neg
+
+    def _override_query_indices_for_random_static_history(
+        self,
+        abs_idx: int,
+        ep_idx: int,
+        query_indices: dict[str, list[int]],
+        padding: dict[str, torch.Tensor],
+    ) -> None:
+        """Override camera/timestamp query indices with sampled hierarchical history deltas."""
+        sampled_neg = self._sample_static_history_deltas()
+        if len(sampled_neg) == 0:
+            return
+
+        deltas = [*sampled_neg, 0]
+        # Positive frame-gap integers for each history level (e.g., [42, 18]).
+        padding["history_frame_deltas"] = torch.tensor([-d for d in sampled_neg], dtype=torch.int64)
+        ep = self.meta.episodes[ep_idx]
+        ep_start = ep["dataset_from_index"]
+        ep_end = ep["dataset_to_index"]
+        target_keys = [*self.meta.camera_keys, "timestamp"]
+
+        for key in target_keys:
+            if key not in query_indices:
+                continue
+            query_indices[key] = [max(ep_start, min(ep_end - 1, abs_idx + delta)) for delta in deltas]
+            padding[f"{key}_is_pad"] = torch.BoolTensor(
+                [(abs_idx + delta < ep_start) | (abs_idx + delta >= ep_end) for delta in deltas]
+            )
+
     def _get_query_timestamps(
         self,
         current_ts: float,
@@ -609,6 +656,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Ensure dataset is loaded when we actually need to read from it
         self._ensure_hf_dataset_loaded()
         item = self.hf_dataset[idx]
+        # Keep scalar current timestamp before optional delta stacking replaces `item["timestamp"]` with a vector.
+        current_ts = item["timestamp"].item()
         ep_idx = item["episode_index"].item()
         # Use the absolute index from the dataset for delta timestamp calculations
         abs_idx = item["index"].item()
@@ -616,13 +665,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
         query_indices = None
         if self.delta_indices is not None:
             query_indices, padding = self._get_query_indices(abs_idx, ep_idx)
+            self._override_query_indices_for_random_static_history(abs_idx, ep_idx, query_indices, padding)
             query_result = self._query_hf_dataset(query_indices)
             item = {**item, **padding}
             for key, val in query_result.items():
                 item[key] = val
 
         if len(self.meta.video_keys) > 0:
-            current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)
             item = {**video_frames, **item}

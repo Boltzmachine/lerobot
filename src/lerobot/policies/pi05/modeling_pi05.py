@@ -750,6 +750,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self,
         current_img_emb: torch.Tensor,
         history_img_embs: list[torch.Tensor],
+        history_time_deltas: list[Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, list[Tensor]]]:
         """Randomly replace static token slices with previous-step static slices."""
         if len(history_img_embs) == 0:
@@ -816,13 +817,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             ):
                 aux_terms["nce_loss"].append(self._compute_nce_loss(current_static, previous_static))
 
-                if self.config.static_observation_delta_indices is not None:
-                    delta_idx = abs(self.config.static_observation_delta_indices[level])
+                if history_time_deltas is not None and level < len(history_time_deltas):
+                    time_delta = history_time_deltas[level].to(gate_logits.dtype).to(gate_logits.device)
+                    p_past = torch.exp(-time_delta / self.config.cache_prior_tau)
                 else:
-                    delta_idx = 1
-                p_past = math.exp(-float(delta_idx) / self.config.cache_prior_tau)
-                gt_prob = torch.tensor([p_past, 1.0 - p_past], device=gate_logits.device, dtype=gate_logits.dtype)
-                gt_prob = gt_prob[None, :].expand(gate_logits.shape[0], -1)
+                    raise NotImplementedError("Time deltas must be provided for probability regularization loss.")
+                gt_prob = torch.stack([p_past, 1.0 - p_past], dim=-1)
                 log_gate_prob = gate_logits.log_softmax(-1)
                 aux_terms["prob_reg_loss"].append(-(gt_prob * log_gate_prob).sum(-1).mean())
                 aux_terms["z_loss"].append(torch.logsumexp(gate_logits, dim=-1).pow(2).mean())
@@ -847,6 +847,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         tokens,
         masks,
         other_images: list[list[torch.Tensor]] | None = None,
+        history_time_deltas: list[Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, list[Tensor]]]:
         """Embed images with SigLIP and language tokens with embedding layer."""
         embs = []
@@ -865,7 +866,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 history_img_embs = []
                 for level_imgs in other_images:
                     history_img_embs.append(self._apply_checkpoint(image_embed_func, level_imgs[cam_idx]))
-                img_emb, img_aux_terms = self._mix_static_dynamic_tokens(img_emb, history_img_embs)
+                img_emb, img_aux_terms = self._mix_static_dynamic_tokens(
+                    img_emb, history_img_embs, history_time_deltas=history_time_deltas
+                )
                 for key in aux_terms:
                     aux_terms[key].extend(img_aux_terms.get(key, []))
             bsize, num_img_embs = img_emb.shape[:2]
@@ -953,6 +956,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         noise=None,
         time=None,
         other_images: list[list[torch.Tensor]] | None = None,
+        history_time_deltas: list[Tensor] | None = None,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """Do a full training forward pass and compute the loss."""
         if noise is None:
@@ -966,7 +970,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks, aux_terms = self.embed_prefix(
-            images, img_masks, tokens, masks, other_images=other_images
+            images,
+            img_masks,
+            tokens,
+            masks,
+            other_images=other_images,
+            history_time_deltas=history_time_deltas,
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
@@ -1377,9 +1386,41 @@ class PI05Policy(PreTrainedPolicy):
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
+    def _sample_history_steps(self, batch_size: int, device: torch.device) -> list[Tensor]:
+        """Sample history step offsets from configured ranges.
+
+        Example with ranges [-42, -18]:
+        - sample second level from [1, 18]
+        - sample first level from [second+1, 42]
+        """
+        if not self.config.static_observation_delta_indices:
+            return []
+
+        bounds = sorted([abs(int(v)) for v in self.config.static_observation_delta_indices], reverse=True)
+        sampled_steps: list[Tensor] = []
+        minval = torch.ones(batch_size, device=device, dtype=torch.long)
+
+        for bound in reversed(bounds):
+            if bound < 1:
+                raise ValueError(f"Invalid static observation range bound: {bound}")
+            maxval = torch.full((batch_size,), bound, device=device, dtype=torch.long)
+            low = minval.float()
+            high = (maxval + 1).float()
+            rand = torch.rand(batch_size, device=device)
+            sampled = torch.floor(rand * (high - low) + low).long()
+            sampled_steps.insert(0, sampled)
+            minval = sampled + 1
+        return sampled_steps
+
+    @staticmethod
+    def _select_temporal_frame(tensor: Tensor, frame_indices: Tensor) -> Tensor:
+        """Select one temporal frame per batch item from [B, T, ...] tensor."""
+        batch_indices = torch.arange(tensor.shape[0], device=tensor.device)
+        return tensor[batch_indices, frame_indices]
+
     def _preprocess_images(
         self, batch: dict[str, Tensor]
-    ) -> tuple[list[Tensor], list[Tensor], list[list[Tensor]] | None]:
+    ) -> tuple[list[Tensor], list[Tensor], list[list[Tensor]] | None, list[Tensor] | None]:
         """Preprocess images for the model.
 
         Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
@@ -1388,6 +1429,7 @@ class PI05Policy(PreTrainedPolicy):
         images = []
         img_masks = []
         history_images: list[list[Tensor]] = []
+        history_time_deltas: list[Tensor] | None = None
 
         # Get device from model parameters
         device = next(self.parameters()).device
@@ -1434,18 +1476,59 @@ class PI05Policy(PreTrainedPolicy):
 
         # Preprocess image features present in the batch
         processed_cameras = 0
+        sampled_history_steps: list[Tensor] | None = None
+        sampled_temporal_indices: list[Tensor] | None = None
         for key in present_img_keys:
             img = batch[key]
             if img.ndim == 5:
                 # Temporal visual history is provided as [B, T, C, H, W] (or channels-last equivalent).
                 n_steps = img.shape[1]
+                if sampled_history_steps is None:
+                    num_history_levels = (
+                        len(self.config.static_observation_delta_indices)
+                        if self.config.static_observation_delta_indices is not None
+                        else 0
+                    )
+                    # If dataset already returned compact sampled history ([hist..., current]),
+                    # use it directly; otherwise sample indices from the loaded temporal window.
+                    if num_history_levels > 0 and n_steps == num_history_levels + 1:
+                        sampled_history_steps = [torch.zeros(img.shape[0], device=img.device, dtype=torch.long)] * num_history_levels
+                        sampled_temporal_indices = [torch.full((img.shape[0],), i, device=img.device, dtype=torch.long) for i in range(num_history_levels)]
+                    else:
+                        sampled_history_steps = self._sample_history_steps(img.shape[0], img.device)
+                        sampled_temporal_indices = [n_steps - 1 - step for step in sampled_history_steps]
+                    history_time_deltas = []
+                    if "history_frame_deltas" in batch:
+                        hfd = batch["history_frame_deltas"].to(device)
+                        if hfd.ndim == 1:
+                            hfd = hfd.unsqueeze(0)
+                        for level in range(hfd.shape[1]):
+                            history_time_deltas.append(hfd[:, level].to(torch.int64))
+                    elif "index" in batch and batch["index"].ndim == 2:
+                        # Use frame-count separation (preferred): delta_frames = current_index - history_index
+                        frame_idx = batch["index"].to(device)
+                        current_idx = frame_idx[:, -1]
+                        for temporal_idx in sampled_temporal_indices:
+                            hist_idx = self._select_temporal_frame(frame_idx, temporal_idx)
+                            history_time_deltas.append((current_idx - hist_idx).to(torch.float32))
+                    elif "timestamp" in batch and batch["timestamp"].ndim == 2:
+                        # Fallback when frame indices are unavailable.
+                        ts = batch["timestamp"].to(device)
+                        current_ts = ts[:, -1]
+                        for temporal_idx in sampled_temporal_indices:
+                            hist_ts = self._select_temporal_frame(ts, temporal_idx)
+                            history_time_deltas.append((current_ts - hist_ts).to(torch.float32))
+
                 current_img = preprocess_single_image(img[:, -1])
                 images.append(current_img)
-                while len(history_images) < (n_steps - 1):
+                num_history_levels = len(sampled_temporal_indices) if sampled_temporal_indices is not None else 0
+                while len(history_images) < num_history_levels:
                     # Backfill newly created history levels with current-frame placeholders for already processed cameras.
                     history_images.append([images[i] for i in range(processed_cameras)])
-                for level in range(n_steps - 1):
-                    history_images[level].append(preprocess_single_image(img[:, level]))
+                if sampled_temporal_indices is not None:
+                    for level, temporal_idx in enumerate(sampled_temporal_indices):
+                        history_frame = self._select_temporal_frame(img, temporal_idx)
+                        history_images[level].append(preprocess_single_image(history_frame))
                 img_for_mask = current_img
             else:
                 img_for_mask = preprocess_single_image(img)
@@ -1467,7 +1550,7 @@ class PI05Policy(PreTrainedPolicy):
             for history_level in history_images:
                 history_level.append(torch.ones_like(img) * -1)
 
-        return images, img_masks, (history_images if len(history_images) > 0 else None)
+        return images, img_masks, (history_images if len(history_images) > 0 else None), history_time_deltas
 
     def prepare_action(self, batch):
         """Pad action"""
@@ -1497,7 +1580,7 @@ class PI05Policy(PreTrainedPolicy):
         self.eval()
 
         # Prepare inputs
-        images, img_masks, other_images = self._preprocess_images(batch)
+        images, img_masks, other_images, _history_time_deltas = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
@@ -1519,14 +1602,20 @@ class PI05Policy(PreTrainedPolicy):
                 - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
         """
         # Prepare inputs
-        images, img_masks, other_images = self._preprocess_images(batch)
+        images, img_masks, other_images, history_time_deltas = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.prepare_action(batch)
 
         # Compute loss (no separate state needed for PI05)
         losses, aux_metrics = self.model.forward(
-            images, img_masks, tokens, masks, actions, other_images=other_images
+            images,
+            img_masks,
+            tokens,
+            masks,
+            actions,
+            other_images=other_images,
+            history_time_deltas=history_time_deltas,
         )
 
         # Truncate losses to actual action dimensions

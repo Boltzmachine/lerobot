@@ -64,10 +64,14 @@ def resolve_delta_timestamps(
     # only apply temporal deltas to visual observation keys, while leaving state/task untouched.
     static_obs_delta_indices = getattr(cfg, "static_observation_delta_indices", None)
     if static_obs_delta_indices:
+        # `static_observation_delta_indices` defines history ranges (e.g. [-42, -18]).
+        # We keep a compact temporal payload and sample concrete history steps in dataset __getitem__.
         image_delta_indices = list(dict.fromkeys([*static_obs_delta_indices, 0]))
         image_delta_timestamps = [i / ds_meta.fps for i in image_delta_indices]
         for camera_key in ds_meta.camera_keys:
             delta_timestamps[camera_key] = image_delta_timestamps
+        # Expose timestamp history so losses can use real sampled time deltas.
+        delta_timestamps["timestamp"] = image_delta_timestamps
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None
@@ -101,6 +105,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             root=cfg.dataset.root,
             episodes=cfg.dataset.episodes,
             delta_timestamps=delta_timestamps,
+            static_observation_delta_ranges=getattr(cfg.policy, "static_observation_delta_indices", None),
             image_transforms=image_transforms,
             revision=cfg.dataset.revision,
             video_backend=cfg.dataset.video_backend,

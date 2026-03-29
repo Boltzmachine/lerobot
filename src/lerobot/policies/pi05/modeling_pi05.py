@@ -138,12 +138,14 @@ def make_att_2d_masks(pad_masks, att_masks):  # see openpi `make_att_2d_masks` (
 
 
 def pad_vector(vector, new_dim):
-    """Pad the last dimension of a vector to new_dim with zeros.
+    """Pad or truncate the last dimension of a vector to ``new_dim``.
 
     Can be (batch_size x sequence_length x features_dimension)
     or (batch_size x features_dimension)
     """
-    if vector.shape[-1] >= new_dim:
+    if vector.shape[-1] > new_dim:
+        return vector[..., :new_dim]
+    if vector.shape[-1] == new_dim:
         return vector
     return F.pad(vector, (0, new_dim - vector.shape[-1]))
 
@@ -1150,6 +1152,8 @@ class PI05Policy(PreTrainedPolicy):
 
         # Get device from model parameters
         device = next(self.parameters()).device
+        batch.pop('observation.images.leftImg', None)
+        batch.pop('observation.images.rightImg', None)
 
         present_img_keys = [key for key in self.config.image_features if key in batch]
         missing_img_keys = [key for key in self.config.image_features if key not in batch]

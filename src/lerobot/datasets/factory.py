@@ -60,6 +60,15 @@ def resolve_delta_timestamps(
         if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
 
+    # Policy-specific camera history support (e.g. PI0.5 static-dynamic disentanglement):
+    # only apply temporal deltas to visual observation keys, while leaving state/task untouched.
+    static_obs_delta_indices = getattr(cfg, "static_observation_delta_indices", None)
+    if static_obs_delta_indices:
+        image_delta_indices = list(dict.fromkeys([*static_obs_delta_indices, 0]))
+        image_delta_timestamps = [i / ds_meta.fps for i in image_delta_indices]
+        for camera_key in ds_meta.camera_keys:
+            delta_timestamps[camera_key] = image_delta_timestamps
+
     if len(delta_timestamps) == 0:
         delta_timestamps = None
 

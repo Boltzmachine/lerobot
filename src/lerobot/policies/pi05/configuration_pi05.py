@@ -63,6 +63,17 @@ class PI05Config(PreTrainedConfig):
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
+    # Static-dynamic disentanglement settings.
+    # The image at index `0` in this list is used for the first static level, index `1` for the second level, etc.
+    # Current step (t) is always appended automatically by dataset construction.
+    static_observation_delta_indices: list[int] = field(default_factory=lambda: [-42, -18])
+    static_ratio: list[float] = field(default_factory=lambda: [0.5, 0.4])
+    # Probability of keeping current-step static tokens. Otherwise, use the corresponding previous-step static tokens.
+    invswap_ratio: float = 0.2
+    use_cache_gate: bool = False
+    cache_gate_temperature: float = 1.0
+    cache_gate_hard: bool = True
+
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.IDENTITY,
@@ -114,6 +125,23 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if len(self.static_ratio) != len(self.static_observation_delta_indices):
+            raise ValueError(
+                "static_ratio and static_observation_delta_indices must have the same length. "
+                f"Got {len(self.static_ratio)} and {len(self.static_observation_delta_indices)}."
+            )
+
+        if any(r < 0.0 or r >= 1.0 for r in self.static_ratio):
+            raise ValueError("Each static_ratio value must be in [0, 1).")
+
+        if self.invswap_ratio < 0.0 or self.invswap_ratio > 1.0:
+            raise ValueError(f"invswap_ratio must be in [0, 1], got {self.invswap_ratio}.")
+
+        if self.cache_gate_temperature <= 0.0:
+            raise ValueError(
+                f"cache_gate_temperature must be > 0, got {self.cache_gate_temperature}."
+            )
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

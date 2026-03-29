@@ -18,6 +18,7 @@ import builtins
 import copy
 import logging
 import math
+import random
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
@@ -334,6 +335,72 @@ def get_gemma_config(variant: str) -> GemmaConfig:  # see openpi `gemma.py: get_
         raise ValueError(f"Unknown variant: {variant}")
 
 
+class CacheGateImage(nn.Module):
+    """Token-level cache gate for selecting past-vs-current static components."""
+
+    def __init__(self, hidden_dim: int, n_levels: int):
+        super().__init__()
+        self.heads = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(2 * hidden_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, 2),
+                )
+                for _ in range(n_levels)
+            ]
+        )
+
+    def forward(
+        self,
+        past_static_tokens: list[Tensor],
+        current_static_tokens: list[Tensor],
+        temperature: float = 1.0,
+        hard: bool = True,
+        training: bool = True,
+    ) -> tuple[list[Tensor], list[Tensor]]:
+        gates: list[Tensor] = []
+        logits_list: list[Tensor] = []
+        prev_gate: Tensor | None = None
+
+        for level, head in enumerate(self.heads):
+            if level >= len(past_static_tokens) or level >= len(current_static_tokens):
+                break
+
+            past_summary = past_static_tokens[level].mean(dim=1)
+            current_summary = current_static_tokens[level].mean(dim=1)
+            logits = head(torch.cat([past_summary, current_summary], dim=-1))
+            logits_list.append(logits)
+
+            if training:
+                gate = F.gumbel_softmax(logits, tau=temperature, hard=hard, dim=-1)
+            else:
+                argmax = torch.argmax(logits, dim=-1)
+                gate = F.one_hot(argmax, num_classes=2).to(dtype=logits.dtype)
+
+            # Enforce hierarchical consistency across static levels:
+            # if a coarser level has selected "current", all deeper levels must also select "current".
+            if prev_gate is not None:
+                if hard:
+                    use_curr = prev_gate[:, 1] > 0.5
+                    forced_current = torch.zeros_like(gate)
+                    forced_current[:, 1] = 1.0
+                    gate = torch.where(use_curr[:, None], forced_current, gate)
+                else:
+                    current_prob = torch.maximum(prev_gate[:, 1], gate[:, 1])
+                    gate = torch.stack([1.0 - current_prob, current_prob], dim=-1)
+
+                # Matches the invariant used in openvla-oft:
+                # assert ((prev_g[:, 1] - g[:, 1]) < 1e-5).all()
+                if not bool(((prev_gate[:, 1] - gate[:, 1]) < 1e-5).all().item()):
+                    raise AssertionError("Cache gate monotonicity violated across static levels")
+
+            gates.append(gate)
+            prev_gate = gate
+
+        return gates, logits_list
+
+
 class PaliGemmaWithExpertModel(
     nn.Module
 ):  # see openpi `gemma_pytorch.py: PaliGemmaWithExpertModel` this class is almost a exact copy of PaliGemmaWithExpertModel in openpi
@@ -574,6 +641,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             freeze_vision_encoder=config.freeze_vision_encoder,
             train_expert_only=config.train_expert_only,
         )
+        if config.use_cache_gate:
+            self.cache_gate = CacheGateImage(
+                hidden_dim=paligemma_config.width,
+                n_levels=len(config.static_ratio),
+            )
+        else:
+            self.cache_gate = None
 
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
@@ -639,8 +713,92 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
         return time.to(dtype=torch.float32, device=device)
 
+    def _mix_static_dynamic_tokens(
+        self,
+        current_img_emb: torch.Tensor,
+        history_img_embs: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Randomly replace static token slices with previous-step static slices."""
+        if len(history_img_embs) == 0:
+            return current_img_emb
+
+        num_tokens = current_img_emb.shape[1]
+        requested_static_dims = [int(num_tokens * ratio) for ratio in self.config.static_ratio]
+
+        static_dims = []
+        static_total = 0
+        # Keep at least one token for dynamic components.
+        max_static_tokens = max(0, num_tokens - 1)
+        for dim in requested_static_dims[: len(history_img_embs)]:
+            if dim <= 0:
+                static_dims.append(0)
+                continue
+            dim = min(dim, max_static_tokens - static_total)
+            if dim <= 0:
+                static_dims.append(0)
+                continue
+            static_dims.append(dim)
+            static_total += dim
+
+        if static_total == 0:
+            return current_img_emb
+
+        current_static_parts: list[Tensor] = []
+        previous_static_parts: list[Tensor] = []
+        mixed_static_parts = []
+        start = 0
+        for level, dim in enumerate(static_dims):
+            if dim == 0:
+                continue
+            end = start + dim
+            current_static = current_img_emb[:, start:end]
+            previous_static = history_img_embs[level][:, start:end]
+            current_static_parts.append(current_static)
+            previous_static_parts.append(previous_static)
+            start = end
+
+        if self.cache_gate is not None:
+            gates, _ = self.cache_gate(
+                past_static_tokens=previous_static_parts,
+                current_static_tokens=current_static_parts,
+                temperature=self.config.cache_gate_temperature,
+                hard=self.config.cache_gate_hard,
+                training=self.training,
+            )
+            prev_g = None
+            for g in gates:
+                if prev_g is not None:
+                    assert ((prev_g[:, 1] - g[:, 1]) < 1e-5).all()
+                prev_g = g
+            for gate, previous_static, current_static in zip(
+                gates, previous_static_parts, current_static_parts, strict=False
+            ):
+                chosen_static = (
+                    gate[:, :, None, None]
+                    * torch.stack([previous_static, current_static], dim=1)
+                ).sum(dim=1)
+                mixed_static_parts.append(chosen_static)
+        else:
+            for previous_static, current_static in zip(
+                previous_static_parts, current_static_parts, strict=False
+            ):
+                if self.training and random.random() > self.config.invswap_ratio:
+                    chosen_static = previous_static
+                else:
+                    chosen_static = current_static
+                mixed_static_parts.append(chosen_static)
+
+        start = sum(s.shape[1] for s in current_static_parts)
+        dynamic_part = current_img_emb[:, start:]
+        return torch.cat([*mixed_static_parts, dynamic_part], dim=1)
+
     def embed_prefix(
-        self, images, img_masks, tokens, masks
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        other_images: list[list[torch.Tensor]] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer."""
         embs = []
@@ -648,12 +806,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = []
 
         # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
+        for cam_idx, (img, img_mask) in enumerate(zip(images, img_masks, strict=True)):
 
             def image_embed_func(img):
                 return self.paligemma_with_expert.embed_image(img)
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
+            if other_images is not None and len(other_images) > 0:
+                history_img_embs = []
+                for level_imgs in other_images:
+                    history_img_embs.append(self._apply_checkpoint(image_embed_func, level_imgs[cam_idx]))
+                img_emb = self._mix_static_dynamic_tokens(img_emb, history_img_embs)
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
@@ -729,7 +892,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
+    def forward(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        actions,
+        noise=None,
+        time=None,
+        other_images: list[list[torch.Tensor]] | None = None,
+    ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -741,7 +914,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, tokens, masks, other_images=other_images
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
         if (
@@ -793,6 +968,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         masks,
         noise=None,
         num_steps=None,
+        other_images: list[list[torch.Tensor]] | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action."""
@@ -811,7 +987,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, tokens, masks, other_images=other_images
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
@@ -1141,7 +1319,9 @@ class PI05Policy(PreTrainedPolicy):
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
-    def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
+    def _preprocess_images(
+        self, batch: dict[str, Tensor]
+    ) -> tuple[list[Tensor], list[Tensor], list[list[Tensor]] | None]:
         """Preprocess images for the model.
 
         Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
@@ -1149,6 +1329,7 @@ class PI05Policy(PreTrainedPolicy):
         """
         images = []
         img_masks = []
+        history_images: list[list[Tensor]] = []
 
         # Get device from model parameters
         device = next(self.parameters()).device
@@ -1164,10 +1345,7 @@ class PI05Policy(PreTrainedPolicy):
                 f"(batch: {batch.keys()}) (image_features: {self.config.image_features})"
             )
 
-        # Preprocess image features present in the batch
-        for key in present_img_keys:
-            img = batch[key]
-
+        def preprocess_single_image(img: Tensor) -> Tensor:
             # Ensure tensor is on the same device as the model
             if img.device != device:
                 img = img.to(device)
@@ -1190,24 +1368,48 @@ class PI05Policy(PreTrainedPolicy):
             # Normalize from [0,1] to [-1,1] as expected by siglip
             img = img * 2.0 - 1.0
 
-            # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
+            # Convert back to [B, C, H, W] format if it was originally channels-first
             if is_channels_first:
                 img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
 
-            images.append(img)
+            return img
+
+        # Preprocess image features present in the batch
+        processed_cameras = 0
+        for key in present_img_keys:
+            img = batch[key]
+            if img.ndim == 5:
+                # Temporal visual history is provided as [B, T, C, H, W] (or channels-last equivalent).
+                n_steps = img.shape[1]
+                current_img = preprocess_single_image(img[:, -1])
+                images.append(current_img)
+                while len(history_images) < (n_steps - 1):
+                    # Backfill newly created history levels with current-frame placeholders for already processed cameras.
+                    history_images.append([images[i] for i in range(processed_cameras)])
+                for level in range(n_steps - 1):
+                    history_images[level].append(preprocess_single_image(img[:, level]))
+                img_for_mask = current_img
+            else:
+                img_for_mask = preprocess_single_image(img)
+                images.append(img_for_mask)
+                for history_level in history_images:
+                    history_level.append(img_for_mask)
             # Create mask (all ones for real images)
-            bsize = img.shape[0]
+            bsize = img_for_mask.shape[0]
             mask = torch.ones(bsize, dtype=torch.bool, device=device)
             img_masks.append(mask)
+            processed_cameras += 1
 
         # Create image features not present in the batch as fully 0 padded images
         for _num_empty_cameras in range(len(missing_img_keys)):
-            img = torch.ones_like(img) * -1  # Padded with -1 for SigLIP
+            img = torch.ones_like(images[0]) * -1  # Padded with -1 for SigLIP
             mask = torch.zeros_like(mask)  # Mask is zero for empty cameras
             images.append(img)
             img_masks.append(mask)
+            for history_level in history_images:
+                history_level.append(torch.ones_like(img) * -1)
 
-        return images, img_masks
+        return images, img_masks, (history_images if len(history_images) > 0 else None)
 
     def prepare_action(self, batch):
         """Pad action"""
@@ -1237,11 +1439,11 @@ class PI05Policy(PreTrainedPolicy):
         self.eval()
 
         # Prepare inputs
-        images, img_masks = self._preprocess_images(batch)
+        images, img_masks, other_images = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
-        actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
+        actions = self.model.sample_actions(images, img_masks, tokens, masks, other_images=other_images, **kwargs)
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1259,13 +1461,13 @@ class PI05Policy(PreTrainedPolicy):
                 - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
         """
         # Prepare inputs
-        images, img_masks = self._preprocess_images(batch)
+        images, img_masks, other_images = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.prepare_action(batch)
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        losses = self.model.forward(images, img_masks, tokens, masks, actions, other_images=other_images)
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]

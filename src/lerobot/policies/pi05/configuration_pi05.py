@@ -66,7 +66,7 @@ class PI05Config(PreTrainedConfig):
     # Static-dynamic disentanglement settings.
     # The image at index `0` in this list is used for the first static level, index `1` for the second level, etc.
     # Current step (t) is always appended automatically by dataset construction.
-    static_observation_delta_indices: list[int] = field(default_factory=lambda: [-42, -18])
+    static_observation_delta_indices: list[int] | None = field(default_factory=lambda: [-42, -18])
     static_ratio: list[float] = field(default_factory=lambda: [0.5, 0.4])
     # Probability of keeping current-step static tokens. Otherwise, use the corresponding previous-step static tokens.
     invswap_ratio: float = 0.2
@@ -126,7 +126,12 @@ class PI05Config(PreTrainedConfig):
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
 
-        if len(self.static_ratio) != len(self.static_observation_delta_indices):
+        if not self.use_cache_gate:
+            self.static_observation_delta_indices = None
+
+        if self.static_observation_delta_indices is not None and len(self.static_ratio) != len(
+            self.static_observation_delta_indices
+        ):
             raise ValueError(
                 "static_ratio and static_observation_delta_indices must have the same length. "
                 f"Got {len(self.static_ratio)} and {len(self.static_observation_delta_indices)}."

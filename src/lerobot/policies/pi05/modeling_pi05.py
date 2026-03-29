@@ -335,71 +335,93 @@ def get_gemma_config(variant: str) -> GemmaConfig:  # see openpi `gemma.py: get_
         raise ValueError(f"Unknown variant: {variant}")
 
 
-class CacheGateImage(nn.Module):
-    """Token-level cache gate for selecting past-vs-current static components."""
+def sample_gumbel(shape, eps=1e-5):
+    U = torch.rand(shape)
+    return -torch.log(-torch.log(U + eps) + eps)
 
-    def __init__(self, hidden_dim: int, n_levels: int):
+
+def gumbel_softmax_sample(logits, temperature):
+    y = logits + sample_gumbel(logits.size()).to(logits.device)
+    return F.softmax(y / temperature, dim=-1)
+
+def gumbel_softmax(logits, temperature=1., hard=True, use_uniform=False):
+    """
+    ST-gumple-softmax
+    input: [*, n_class]
+    return: flatten --> [*, n_class] an one-hot vector
+    """
+    y = gumbel_softmax_sample(logits, temperature)
+    
+    if not hard:
+        return y
+
+    shape = y.size()
+    _, ind = y.max(dim=-1)
+    if use_uniform:
+        ind = (torch.rand_like(ind.float()) > 0.5).long()
+    y_hard = torch.zeros_like(y).view(-1, shape[-1])
+    y_hard.scatter_(1, ind.view(-1, 1), 1)
+    y_hard = y_hard.view(*shape)
+    # Set gradients w.r.t. y_hard gradients w.r.t. y
+    y_hard = (y_hard - y).detach() + y
+    return y_hard
+
+
+class CacheGateImage(nn.Module):
+    def __init__(self, hidden_dim, static_ratio=None):
         super().__init__()
-        self.heads = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(2 * hidden_dim, hidden_dim),
-                    nn.GELU(),
-                    nn.Linear(hidden_dim, 2),
-                )
-                for _ in range(n_levels)
-            ]
+        self.dim_reduction_vertical = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 128),
+        )
+        self.dim_reduction_horizontal = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Linear(128, 128),
+            nn.GELU(),
+            nn.Linear(128, 64),
         )
 
-    def forward(
-        self,
-        past_static_tokens: list[Tensor],
-        current_static_tokens: list[Tensor],
-        temperature: float = 1.0,
-        hard: bool = True,
-        training: bool = True,
-    ) -> tuple[list[Tensor], list[Tensor]]:
-        gates: list[Tensor] = []
-        logits_list: list[Tensor] = []
-        prev_gate: Tensor | None = None
-
-        for level, head in enumerate(self.heads):
-            if level >= len(past_static_tokens) or level >= len(current_static_tokens):
-                break
-
-            past_summary = past_static_tokens[level].mean(dim=1)
-            current_summary = current_static_tokens[level].mean(dim=1)
-            logits = head(torch.cat([past_summary, current_summary], dim=-1))
-            logits_list.append(logits)
-
-            if training:
-                gate = F.gumbel_softmax(logits, tau=temperature, hard=hard, dim=-1)
-            else:
-                argmax = torch.argmax(logits, dim=-1)
-                gate = F.one_hot(argmax, num_classes=2).to(dtype=logits.dtype)
-
-            # Enforce hierarchical consistency across static levels:
-            # if a coarser level has selected "current", all deeper levels must also select "current".
-            if prev_gate is not None:
-                if hard:
-                    use_curr = prev_gate[:, 1] > 0.5
-                    forced_current = torch.zeros_like(gate)
-                    forced_current[:, 1] = 1.0
-                    gate = torch.where(use_curr[:, None], forced_current, gate)
+        if isinstance(static_ratio, float) or static_ratio is None:
+            self.head = nn.Linear(128 * 64, 2)
+        elif isinstance(static_ratio, list):
+            self.head = nn.ModuleList(
+                nn.Linear(128 * 64, 2) for _ in static_ratio
+            )
+        
+    def forward(self, x_past, x_curr, t_past, t_curr):
+        """
+        x_past - [B, N, d]
+        x_curr - [B, N, d]
+        """
+        if isinstance(self.head, nn.ModuleList):
+            all_gate = []
+            all_logits = []
+            assert isinstance(x_past, list) and len(x_past) == len(self.head    )
+            for i, (_x_past, head) in enumerate(zip(x_past, self.head)):
+                x_past_curr = torch.cat([_x_past, x_curr], dim=-1)
+                x_past_curr = self.dim_reduction_vertical(x_past_curr)
+                x_past_curr = self.dim_reduction_horizontal(x_past_curr.transpose(-1, -2)).transpose(-1, -2)
+                logits = head(x_past_curr.reshape(x_past_curr.shape[0], -1))
+                if i == 0:
+                    gate = gumbel_softmax(logits, hard=True, use_uniform=True)
                 else:
-                    current_prob = torch.maximum(prev_gate[:, 1], gate[:, 1])
-                    gate = torch.stack([1.0 - current_prob, current_prob], dim=-1)
-
-                # Matches the invariant used in openvla-oft:
-                # assert ((prev_g[:, 1] - g[:, 1]) < 1e-5).all()
-                if not bool(((prev_gate[:, 1] - gate[:, 1]) < 1e-1).all().item()):
-                    raise AssertionError("Cache gate monotonicity violated across static levels")
-
-            gates.append(gate)
-            prev_gate = gate
-
-        return gates, logits_list
-
+                    gate_temp = gumbel_softmax(logits, hard=True, use_uniform=True)
+                    use_curr = (gate[:, 1:2] > 0.5)
+                    gate = gate * use_curr + gate_temp * (~use_curr)
+                all_gate.append(gate)
+                all_logits.append(logits)
+            return all_gate, all_logits
+        else:
+            x_past_curr = torch.cat([x_past, x_curr], dim=-1)
+            x_past_curr = self.dim_reduction_vertical(x_past_curr)
+            x_past_curr = self.dim_reduction_horizontal(x_past_curr.transpose(-1, -2)).transpose(-1, -2)
+            logits = self.head(x_past_curr.reshape(x_past_curr.shape[0], -1))
+            gate = gumbel_softmax(logits, hard=True, use_uniform=True)
+            return gate, logits
 
 class PaliGemmaWithExpertModel(
     nn.Module
@@ -644,7 +666,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if config.use_cache_gate:
             self.cache_gate = CacheGateImage(
                 hidden_dim=paligemma_config.width,
-                n_levels=len(config.static_ratio),
+                static_ratio=config.static_ratio,
             )
         else:
             self.cache_gate = None
@@ -759,17 +781,16 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         if self.cache_gate is not None:
             gates, _ = self.cache_gate(
-                past_static_tokens=previous_static_parts,
-                current_static_tokens=current_static_parts,
-                temperature=self.config.cache_gate_temperature,
-                hard=self.config.cache_gate_hard,
-                training=self.training,
+                x_past=history_img_embs,
+                x_curr=current_img_emb,
+                t_past=None,
+                t_curr=None,
             )
-            # prev_g = None
-            # for g in gates:
-            #     if prev_g is not None:
-            #         assert ((prev_g[:, 1] - g[:, 1]) < 1e-5).all()
-            #     prev_g = g
+            prev_g = None
+            for g in gates:
+                if prev_g is not None:
+                    assert ((prev_g[:, 1] - g[:, 1]) < 1e-1).all()
+                prev_g = g
             for gate, previous_static, current_static in zip(
                 gates, previous_static_parts, current_static_parts, strict=False
             ):

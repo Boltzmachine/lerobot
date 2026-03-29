@@ -1659,7 +1659,11 @@ class PI05Policy(PreTrainedPolicy):
             "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
         )
         target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"
+        modules_to_save: list[str] = []
+        if self.config.use_cache_gate:
+            # Keep cache gate as a fully-trainable module and persist it in PEFT adapter checkpoints.
+            modules_to_save.append("model.cache_gate")
         return {
             "target_modules": target_modules,
-            "modules_to_save": [],
+            "modules_to_save": modules_to_save,
         }

@@ -73,6 +73,10 @@ class PI05Config(PreTrainedConfig):
     use_cache_gate: bool = False
     cache_gate_temperature: float = 1.0
     cache_gate_hard: bool = True
+    contrastive_loss_weight: float = 0.1
+    prob_reg_loss_weight: float = 0.1
+    z_loss_weight: float = 1e-4
+    cache_prior_tau: float = 10.0
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -147,6 +151,9 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 f"cache_gate_temperature must be > 0, got {self.cache_gate_temperature}."
             )
+
+        if self.cache_prior_tau <= 0.0:
+            raise ValueError(f"cache_prior_tau must be > 0, got {self.cache_prior_tau}.")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

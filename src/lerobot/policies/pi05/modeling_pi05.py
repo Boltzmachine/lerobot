@@ -735,14 +735,25 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
         return time.to(dtype=torch.float32, device=device)
 
+    @staticmethod
+    def _compute_nce_loss(features1: Tensor, features2: Tensor) -> Tensor:
+        """NCE loss between static features from current and past observations."""
+        static_features = F.normalize(features1, dim=-1).transpose(0, 1)  # (N, B, F)
+        other_static_features = F.normalize(features2, dim=-1).transpose(0, 1)  # (N, B, F)
+        positive_logits = (static_features * other_static_features).sum(-1)  # (N, B)
+        pair_logits = static_features @ static_features.transpose(1, 2)  # (N, B, B)
+        pair_logits.diagonal(dim1=1, dim2=2).copy_(positive_logits)
+        targets = torch.arange(pair_logits.size(-1), device=pair_logits.device).repeat(pair_logits.size(0))
+        return F.cross_entropy(pair_logits.reshape(-1, pair_logits.size(-1)), targets)
+
     def _mix_static_dynamic_tokens(
         self,
         current_img_emb: torch.Tensor,
         history_img_embs: list[torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict[str, list[Tensor]]]:
         """Randomly replace static token slices with previous-step static slices."""
         if len(history_img_embs) == 0:
-            return current_img_emb
+            return current_img_emb, {}
 
         num_tokens = current_img_emb.shape[1]
         requested_static_dims = [int(num_tokens * ratio) for ratio in self.config.static_ratio]
@@ -763,11 +774,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             static_total += dim
 
         if static_total == 0:
-            return current_img_emb
+            return current_img_emb, {}
 
         current_static_parts: list[Tensor] = []
         previous_static_parts: list[Tensor] = []
         mixed_static_parts = []
+        aux_terms: dict[str, list[Tensor]] = {"nce_loss": [], "prob_reg_loss": [], "z_loss": []}
         start = 0
         for level, dim in enumerate(static_dims):
             if dim == 0:
@@ -780,7 +792,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             start = end
 
         if self.cache_gate is not None:
-            gates, _ = self.cache_gate(
+            gates, gate_logits_list = self.cache_gate(
                 x_past=history_img_embs,
                 x_curr=current_img_emb,
                 t_past=None,
@@ -799,6 +811,21 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     * torch.stack([previous_static, current_static], dim=1)
                 ).sum(dim=1)
                 mixed_static_parts.append(chosen_static)
+            for level, (gate_logits, previous_static, current_static) in enumerate(
+                zip(gate_logits_list, previous_static_parts, current_static_parts, strict=False)
+            ):
+                aux_terms["nce_loss"].append(self._compute_nce_loss(current_static, previous_static))
+
+                if self.config.static_observation_delta_indices is not None:
+                    delta_idx = abs(self.config.static_observation_delta_indices[level])
+                else:
+                    delta_idx = 1
+                p_past = math.exp(-float(delta_idx) / self.config.cache_prior_tau)
+                gt_prob = torch.tensor([p_past, 1.0 - p_past], device=gate_logits.device, dtype=gate_logits.dtype)
+                gt_prob = gt_prob[None, :].expand(gate_logits.shape[0], -1)
+                log_gate_prob = gate_logits.log_softmax(-1)
+                aux_terms["prob_reg_loss"].append(-(gt_prob * log_gate_prob).sum(-1).mean())
+                aux_terms["z_loss"].append(torch.logsumexp(gate_logits, dim=-1).pow(2).mean())
         else:
             for previous_static, current_static in zip(
                 previous_static_parts, current_static_parts, strict=False
@@ -811,7 +838,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         start = sum(s.shape[1] for s in current_static_parts)
         dynamic_part = current_img_emb[:, start:]
-        return torch.cat([*mixed_static_parts, dynamic_part], dim=1)
+        return torch.cat([*mixed_static_parts, dynamic_part], dim=1), aux_terms
 
     def embed_prefix(
         self,
@@ -820,11 +847,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         tokens,
         masks,
         other_images: list[list[torch.Tensor]] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, list[Tensor]]]:
         """Embed images with SigLIP and language tokens with embedding layer."""
         embs = []
         pad_masks = []
         att_masks = []
+        aux_terms: dict[str, list[Tensor]] = {"nce_loss": [], "prob_reg_loss": [], "z_loss": []}
 
         # Process images
         for cam_idx, (img, img_mask) in enumerate(zip(images, img_masks, strict=True)):
@@ -837,7 +865,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 history_img_embs = []
                 for level_imgs in other_images:
                     history_img_embs.append(self._apply_checkpoint(image_embed_func, level_imgs[cam_idx]))
-                img_emb = self._mix_static_dynamic_tokens(img_emb, history_img_embs)
+                img_emb, img_aux_terms = self._mix_static_dynamic_tokens(img_emb, history_img_embs)
+                for key in aux_terms:
+                    aux_terms[key].extend(img_aux_terms.get(key, []))
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
@@ -864,7 +894,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
-        return embs, pad_masks, att_masks
+        return embs, pad_masks, att_masks, aux_terms
 
     def embed_suffix(self, noisy_actions, timestep):
         """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -923,7 +953,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         noise=None,
         time=None,
         other_images: list[list[torch.Tensor]] | None = None,
-    ) -> Tensor:
+    ) -> tuple[Tensor, dict[str, Tensor]]:
         """Do a full training forward pass and compute the loss."""
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -935,7 +965,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks, aux_terms = self.embed_prefix(
             images, img_masks, tokens, masks, other_images=other_images
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
@@ -978,7 +1008,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        mse_losses = F.mse_loss(u_t, v_t, reduction="none")
+        aux_metrics: dict[str, Tensor] = {}
+        for key, values in aux_terms.items():
+            if len(values) > 0:
+                aux_metrics[key] = torch.stack(values).mean()
+            else:
+                aux_metrics[key] = torch.tensor(0.0, device=mse_losses.device, dtype=mse_losses.dtype)
+        return mse_losses, aux_metrics
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -1008,7 +1045,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks, _ = self.embed_prefix(
             images, img_masks, tokens, masks, other_images=other_images
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -1488,7 +1525,9 @@ class PI05Policy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions, other_images=other_images)
+        losses, aux_metrics = self.model.forward(
+            images, img_masks, tokens, masks, actions, other_images=other_images
+        )
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1498,14 +1537,30 @@ class PI05Policy(PreTrainedPolicy):
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
         }
 
+        nce_loss = aux_metrics.get("nce_loss", torch.tensor(0.0, device=losses.device, dtype=losses.dtype))
+        prob_reg_loss = aux_metrics.get(
+            "prob_reg_loss", torch.tensor(0.0, device=losses.device, dtype=losses.dtype)
+        )
+        z_loss = aux_metrics.get("z_loss", torch.tensor(0.0, device=losses.device, dtype=losses.dtype))
+        aux_loss = (
+            self.config.contrastive_loss_weight * nce_loss
+            + self.config.prob_reg_loss_weight * prob_reg_loss
+            + self.config.z_loss_weight * z_loss
+        )
+
+        loss_dict["nce_loss"] = float(nce_loss.detach())
+        loss_dict["prob_reg_loss"] = float(prob_reg_loss.detach())
+        loss_dict["z_loss"] = float(z_loss.detach())
+        loss_dict["aux_loss"] = float(aux_loss.detach())
+
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
+            per_sample_loss = losses.mean(dim=(1, 2)) + aux_loss
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss
-            loss = losses.mean()
+            loss = losses.mean() + aux_loss
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
